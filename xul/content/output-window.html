@@ -36,6 +36,10 @@
           width: 100%;
         }
 
+        #dcc-file-container {
+          overflow: hidden;
+        }
+
         #splash {
           font-size: 24pt;
           font-weight: bold;
@@ -193,8 +197,12 @@
               <td class="label" localize="output.file"></td>
               <td class="value crop-right" id="dcc-file-file" width="100%"></td>
               <td class="label" localize="output.progress"></td>
-              <td class="value" id="dcc-file-progress" localize="unknown"></td>
+              <td class="value crop-right" id="dcc-file-progress" localize="unknown"></td>
             </tr>
+          </tbody>
+        </table>
+        <table class="h-table">
+          <tbody>
             <tr>
               <td colspan="4" class="progress-bg">
                 <table id="dcc-file-progressbar" width="0%"><tbody><tr>
