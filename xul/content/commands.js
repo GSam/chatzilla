@@ -47,6 +47,8 @@ function initCommands()
                                                     CMD_NEED_NET | CMD_CONSOLE],
          ["dcc-accept-list-remove", cmdDCCAutoAcceptDel,
                                                     CMD_NEED_NET | CMD_CONSOLE],
+         ["dcc-resume",        cmdDCCResume,                       CMD_CONSOLE],
+         ["dcc-stop-n-resume", cmdDCCStopAndResume,                          0],
          ["dcc-chat",          cmdDCCChat,          CMD_NEED_SRV | CMD_CONSOLE],
          ["dcc-close",         cmdDCCClose,                        CMD_CONSOLE],
          ["dcc-decline",       cmdDCCDecline,                      CMD_CONSOLE],
@@ -4082,7 +4084,8 @@ function cmdDCCClose(e)
     // Go ask the DCC code for some matching requets.
     var list = client.dcc.getMatches
               (e.nickname, e.file, e.type, [DCC_DIR_GETTING, DCC_DIR_SENDING],
-               [DCC_STATE_REQUESTED, DCC_STATE_ACCEPTED, DCC_STATE_CONNECTED]);
+               [DCC_STATE_REQUESTED, DCC_STATE_RESUMING, 
+                DCC_STATE_ACCEPTED, DCC_STATE_CONNECTED]);
 
     // Disconnect if only one match.
     if (list.length == 1)
@@ -4211,13 +4214,43 @@ function cmdDCCList(e) {
                 state = MSG_DCC_STATE_REQUEST;
                 if (c.state.dir == DCC_DIR_GETTING)
                 {
-                    cmds = getMsg(MSG_DCC_COMMAND_ACCEPT, "dcc-accept " + c.id) + " " +
-                           getMsg(MSG_DCC_COMMAND_DECLINE, "dcc-decline " + c.id);
+                    if (c.reofferFor)
+                    {
+                        state = MSG_DCC_STATE_REOFFER;
+                        cmds = getMsg(MSG_DCC_COMMAND_STOP_CURRENT,
+                                      "dcc-stop-n-resume " + c.reofferFor.id) +
+                               " ";
+                    }
+                    else
+                    {
+                        cmds = "";
+                    }
+
+                    cmds += getMsg(MSG_DCC_COMMAND_ACCEPT,
+                                  "dcc-accept " + c.id) + " ";
+
+                    // For file transfers with sizes given, the sender may
+                    // support DCC RESUME
+                    if ((c.TYPE == "IRCDCCFileTransfer") && (c.size > 0))
+                    {
+                        cmds += getMsg(MSG_DCC_COMMAND_RESUME,
+                                       "dcc-resume " + c.id) + " ";
+                    }
+
+                    cmds += getMsg(MSG_DCC_COMMAND_DECLINE,
+                                   "dcc-decline " + c.id);
                 }
                 else
                 {
                     cmds = getMsg(MSG_DCC_COMMAND_CANCEL, "dcc-close " + c.id);
                 }
+                counts.pending++;
+                break;
+            case DCC_STATE_RESUMING:
+                state = MSG_DCC_STATE_RESUME;
+                cmds = getMsg(MSG_DCC_COMMAND_ACCEPT, "dcc-accept " + c.id) +
+                       " " +
+                       getMsg(MSG_DCC_COMMAND_DECLINE, "dcc-decline " + c.id);
                 counts.pending++;
                 break;
             case DCC_STATE_ACCEPTED:
@@ -4252,9 +4285,11 @@ function cmdDCCList(e) {
                 break;
         }
         client.munger.getRule(".inline-buttons").enabled = true;
+        client.munger.getRule("face").enabled = false;
         display(getMsg(MSG_DCCLIST_LINE, [k + 1, state, dir, type, tf,
                                           c.unicodeName, c.remoteIP, c.port,
                                           cmds]));
+        client.munger.getRule("face").enabled = client.prefs["munger.face"];
         client.munger.getRule(".inline-buttons").enabled = false;
     }
     display(getMsg(MSG_DCCLIST_SUMMARY, [counts.pending, counts.connected,
@@ -4368,11 +4403,16 @@ function cmdDCCAccept(e)
         if (m)
             ext = "*." + m[1];
 
+        // Prevent auto-accept from starting the download while we pick where
+        // to put it by setting  c.suppressAuto
+        c.suppressAuto = true;
         var pickerRv = pickSaveAs(getMsg(MSG_DCCFILE_SAVE_TO, filename),
                                   ["$all", ext], filename);
+        delete c.suppressAuto;
         if (!pickerRv.ok)
             return false;
 
+        c.setReoffer();
         if (!c.accept(pickerRv.file))
             return false;
 
@@ -4401,7 +4441,9 @@ function cmdDCCAccept(e)
 
     // Go ask the DCC code for some matching requets.
     var list = client.dcc.getMatches(e.nickname, e.file, e.type,
-                                     [DCC_DIR_GETTING], [DCC_STATE_REQUESTED]);
+                                     [DCC_DIR_GETTING],
+                                     [DCC_STATE_REQUESTED,
+                                      DCC_STATE_RESUMING]);
     // Accept if only one match.
     if (list.length == 1)
         return accept(list[0]);
@@ -4409,6 +4451,181 @@ function cmdDCCAccept(e)
     // Oops, couldn't figure the user's request out, so give them some help.
     display(getMsg(MSG_DCC_PENDING_MATCHES, [list.length]));
     display(MSG_DCC_MATCHES_HELP);
+    return true;
+}
+
+function cmdDCCResume(e)
+{
+    if (!jsenv.HAS_SERVER_SOCKETS)
+        return display(MSG_DCC_NOT_POSSIBLE);
+    if (!client.prefs["dcc.enabled"])
+        return display(MSG_DCC_NOT_ENABLED);
+
+    function resume(c)
+    {
+        if ((c.state.state != DCC_STATE_REQUESTED) ||
+            (c.TYPE != "IRCDCCFileTransfer"))
+        {
+            return false;
+        }
+
+        // FIXME: check if the user in question accepts CTCPs.
+        //        Resume is impossible without CTCP acceptance for both sides.
+        //        Should we cache this information, or...?
+        //         - I'm pretty sure this doesn't show up on the WHO list
+        //         - Is there any indication of change in this?
+        // We know that we can receive CTCPs, because we had to
+        // in order to receive the DCC SEND message!
+        //     msg: MSG_DCCFILE_ERR_NOCTCP
+        //   param: c.user.unicodeName
+
+        // Resume the request passed in...
+        var filename = c.filename;
+        var ext = "*";
+        var m = filename.match(/...\.([a-z]+)$/i);
+        if (m)
+            ext = "*." + m[1];
+
+        // Prevent auto-accept from starting the download while we pick where
+        // to put it by setting  c.suppressAuto
+        c.suppressAuto = true;
+
+        // FIXME: This could be done better: limiting the display
+        //        to files matching the requirements to start with.
+        //        It'd be nice if the OK button said "Resume" instead
+        //        of "Open" too, of course...
+        var pickerRv = pickOpen(getMsg(MSG_DCCFILE_RESUME_TO, filename),
+                                ["$all", ext], filename);
+        delete c.suppressAuto;
+        if (!pickerRv.ok)
+            return false;
+
+        var file = pickerRv.file;
+        if (!file.exists())
+            return display(MSG_DCCFILE_ERR_NOTFOUND);
+        if (!file.isFile())
+            return display(MSG_DCCFILE_ERR_NOTAFILE);
+        if (!file.isReadable())
+            return display(MSG_DCCFILE_ERR_NOTREADABLE);
+        if (!file.isWritable())
+            return display(MSG_DCCFILE_ERR_NOTWRITABLE);
+        if (file.fileSize >= c.size)
+            return display(MSG_DCCFILE_ERR_NOTRESUMABLE);
+        if (m = client.dcc.findFileTransfer(file, c))
+        {
+            if (c.isSameFile(m))
+            {
+                // setReoffer presents its own error messages for every case
+                // this command should be able to invoke
+                if (! c.setReoffer(m, file, true))
+                    return false;
+
+                client.munger.getRule(".inline-buttons").enabled = true;
+                display(getMsg(MSG_DCCFILE_RESUME_INPROGRESS,
+                               getMsg(MSG_DCC_COMMAND_STOP_CURRENT,
+                                      "dcc-stop-n-resume " + m.id)),
+                        "DCC-FILE");
+                client.munger.getRule(".inline-buttons").enabled = false;
+                return false;
+            }
+            else
+            {
+                return display(MSG_DCCFILE_ERR_INPROGRESS);
+            }
+        }
+
+        c.setReoffer();
+        if (!c.resume(file))
+            return false;
+
+        display(getMsg(MSG_DCCFILE_RESUMING_CMD,
+                       c._getParams().concat([getSISize(file.fileSize)])),
+                "DCC-FILE");
+
+        setupResumeFallback({ o: c, fallback: onDCCCmdResumeTimeout });
+        return true;
+    }
+
+    // If there is no nickname specified, use the "last" item.
+    // This is the last DCC request that arrived.
+    if (!e.nickname && client.dcc.last)
+    {
+        if ((new Date() - client.dcc.lastTime) >= 10000)
+            return resume(client.dcc.last);
+        return display(MSG_DCCFILE_ERR_RESUME_TIME);
+    }
+
+    var o = client.dcc.findByID(e.nickname);
+    if (o)
+        // Direct ID --> object request.
+        return resume(o);
+
+    var list = client.dcc.getMatches(e.nickname, e.file, ["file"],
+                                     [DCC_DIR_GETTING],
+                                     [DCC_STATE_REQUESTED]);
+    // Accept if only one match.
+    if (list.length == 1)
+        return resume(list[0]);
+
+    // Oops, couldn't figure the user's request out, so give them some help.
+    display(getMsg(MSG_DCC_PENDING_MATCHES, [list.length]));
+    display(MSG_DCC_MATCHES_HELP);
+    return true;
+}
+
+function cmdDCCStopAndResume(e)
+{
+    if (!jsenv.HAS_SERVER_SOCKETS)
+        return display(MSG_DCC_NOT_POSSIBLE);
+    if (!client.prefs["dcc.enabled"])
+        return display(MSG_DCC_NOT_ENABLED);
+
+    var o = client.dcc.findByID(e.oldID);
+    var n = null;
+
+    if (e.newID)
+    {
+        n = client.dcc.findByID(e.newID);
+        if (! n.lastFile)
+            n = null;
+    }
+
+    // If neither original transfer nor reoffer can be found, fail
+    if ((! o) && (! n))
+        return display(MSG_DCCFILE_ERR_NO_OFFER, "DCC-FILE");
+
+    // If the original transfer can't be found at all, either complain or
+    // activate the chosen offer
+    if (! o)
+    {
+        if (n.state.state != DCC_STATE_REQUESTED)
+            return display(MSG_DCCFILE_ERR_NO_OFFER, "DCC-FILE");
+        return n.useReoffer();
+    }
+
+    // If a new reoffer has been selected, set it
+    if (n && (! n.setReoffer(o, n.lastFile, true)))
+        return false;
+
+    // If the original transfer exists, but no reoffer, fail
+    if (! o.reoffer)
+        return display(MSG_DCCFILE_ERR_NO_OFFER, "DCC-FILE");
+
+    // If the original transfer is no longer active ...
+    if (! o.isActive())
+    {
+        // ... and the reoffer is already active, there's nothing further to do
+        if (o.reoffer.isActive())
+            return true;
+
+        // Otherwise, simply trigger the reoffer
+        return o.reoffer.useReoffer();
+    }
+
+    // To cause the "reoffer" to be caught, we need to generate a FAILED
+    // state instead of an ABORT state.
+    o.disconnect();
+
     return true;
 }
 
@@ -4422,6 +4639,7 @@ function cmdDCCDecline(e)
     function decline(c)
     {
         // Decline the request passed in...
+        c.setReoffer();
         c.decline();
         if (c.TYPE == "IRCDCCChat")
             display(getMsg(MSG_DCCCHAT_DECLINED, c._getParams()), "DCC-CHAT");
@@ -4444,7 +4662,9 @@ function cmdDCCDecline(e)
 
     // Go ask the DCC code for some matching requets.
     var list = client.dcc.getMatches(e.nickname, e.file, e.type,
-                                     [DCC_DIR_GETTING], [DCC_STATE_REQUESTED]);
+                                     [DCC_DIR_GETTING],
+                                     [DCC_STATE_REQUESTED,
+                                      DCC_STATE_RESUMING]);
     // Decline if only one match.
     if (list.length == 1)
         return decline(list[0]);

@@ -66,6 +66,39 @@ function dcc_adduser(user, remoteIP)
     return new CIRCDCCUser(this, user, remoteIP);
 }
 
+CIRCDCC.prototype.abortReplaced =
+function dcc_abortreplaced(ip, port, exclude)
+{
+    // Catch if there is an existing non-connected incoming file transfer or
+    // DCC chat offer with the same IP and port; cancel old offers found, since
+    // clients identify connections by their port (and not their names...)
+    var k;
+    for (k = 0; k < this.chats.length; k++)
+    {
+        if ((this.chats[k] != exclude) &&
+            (this.chats[k].port == port) &&
+            (this.chats[k].remoteIP == ip) &&
+            (this.chats[k].state.dir == DCC_DIR_GETTING) &&
+            (this.chats[k].state.state == DCC_STATE_REQUESTED))
+        {
+            this.chats[k].abort();
+        }
+    }
+
+    for (k = 0; k < this.files.length; k++)
+    {
+        if ((this.files[k] != exclude) &&
+            (this.files[k].port == port) &&
+            (this.files[k].remoteIP == ip) &&
+            (this.files[k].state.dir == DCC_DIR_GETTING) &&
+            (arrayIndexOf([DCC_STATE_REQUESTED, DCC_STATE_RESUMING],
+                          this.files[k].state.state) >= 0))
+        {
+            this.files[k].abort();
+        }
+    }
+}
+
 CIRCDCC.prototype.addChat =
 function dcc_addchat(user, port)
 {
@@ -122,8 +155,38 @@ function dcc_addip(ip, auth)
         this.localIP = this.localIPlist[0];
 }
 
+CIRCDCC.prototype.renameUser =
+function dcc_renameuser(user)
+{
+    if (user.dccUser)
+        user.dccUser.rename();
+}
+
+CIRCDCC.prototype.findFileTransfer =
+function dcc_findfiletransfer(file, exclude)
+{
+    // Search for any active file transfer attached to the chosen file,
+    // except the file transfer doing the searching (if any)
+    for (k = 0; k < this.files.length; k++)
+    {
+        if ((this.files[k] != exclude) &&
+            (this.files[k].state.dir == DCC_DIR_GETTING) &&
+            (this.files[k].isActive()) &&
+            (((this.files[k].localPath) &&
+              (file.path == this.files[k].localPath)) ||
+             ((this.files[k].localFile) &&
+              (file.equals(this.files[k].localFile.localFile))) ||
+             ((this.files[k].resumingPick) &&
+              (file.equals(this.files[k].resumingPick)))))
+        {
+            return this.files[k];
+        }
+    }
+    return undefined;
+}
+
 CIRCDCC.prototype.getMatches =
-function dcc_getmatches(nickname, filename, types, dirs, states)
+function dcc_getmatches(nickname, filename, types, dirs, states, port)
 {
     function matchNames(name, otherName)
     {
@@ -145,7 +208,9 @@ function dcc_getmatches(nickname, filename, types, dirs, states)
         {
             if ((!nickname || matchNames(this.chats[k].user.unicodeName, n)) &&
                 (!dirs || arrayIndexOf(dirs, this.chats[k].state.dir) >= 0) &&
-                (!states || arrayIndexOf(states, this.chats[k].state.state) >= 0))
+                (!states ||
+                 arrayIndexOf(states, this.chats[k].state.state) >= 0) &&
+                (!port || this.chats[k].port == port))
             {
                 list.push(this.chats[k]);
             }
@@ -158,7 +223,9 @@ function dcc_getmatches(nickname, filename, types, dirs, states)
             if ((!nickname || matchNames(this.files[k].user.unicodeName, n)) &&
                 (!filename || matchNames(this.files[k].filename, f)) &&
                 (!dirs || arrayIndexOf(dirs, this.files[k].state.dir) >= 0) &&
-                (!states || arrayIndexOf(states, this.files[k].state.state) >= 0))
+                (!states ||
+                 arrayIndexOf(states, this.files[k].state.state) >= 0) &&
+                (!port || this.files[k].port == port))
             {
                 list.push(this.files[k]);
             }
@@ -251,6 +318,7 @@ window.val = -1;
 
 const DCC_STATE_FAILED        = val++; // try connect (accept), but it failed.
 const DCC_STATE_INIT          = val++; // not "doing" anything
+const DCC_STATE_RESUMING      = val++; // RESUME request sent
 const DCC_STATE_REQUESTED     = val++; // waiting
 const DCC_STATE_ACCEPTED      = val++; // accepted.
 const DCC_STATE_DECLINED      = val++; // declined.
@@ -294,6 +362,18 @@ function CIRCDCCUser(parent, user, remoteIP)
         this.onInit();
 
     return this;
+}
+
+CIRCDCCUser.prototype.rename =
+function dccuser_rename()
+{
+    this.unicodeName = this.netUser.unicodeName;
+    this.viewName = this.netUser.unicodeName;
+    this.canonicalName = this.netUser.canonicalName;
+
+    var oldkey = this.key;
+    this.key = escape(this.canonicalName) + ":" + this.remoteIP;
+    renameProperty(this.parent.users, oldkey, this.key);
 }
 
 CIRCDCCUser.prototype.TYPE = "IRCDCCUser";
@@ -357,11 +437,52 @@ function dccstate_getRequest()
                                        this.owner, "onRequest"));
 }
 
+CIRCDCCState.prototype.sendResume =
+function dccstate_sendResume()
+{
+    if (((this.state != DCC_STATE_REQUESTED) &&
+         (this.state != DCC_STATE_RESUMING)) ||
+        (this.dir != DCC_DIR_GETTING))
+    {
+        throw "Must be in REQUESTED state and direction GET.";
+    }
+
+    clearTimeout(this.requestTimeout);
+    this.requestTimeout = setTimeout(function (o){ o.abort(); },
+                                     this.parent.requestTimeout, this.owner);
+
+    this.state = DCC_STATE_RESUMING;
+
+    this.eventPump.addEvent(new CEvent(this.eventType, "resuming",
+                                       this.owner, "onResuming"));
+}
+
+CIRCDCCState.prototype.getResume =
+function dccstate_getResume()
+{
+    if ((this.state != DCC_STATE_REQUESTED) ||
+        (this.dir != DCC_DIR_SENDING))
+    {
+        throw "Must be in REQUESTED state and direction SEND.";
+    }
+
+    clearTimeout(this.requestTimeout);
+    this.requestTimeout = setTimeout(function (o){ o.abort(); },
+                                     this.parent.requestTimeout, this.owner);
+
+    this.eventPump.addEvent(new CEvent(this.eventType, "resuming",
+                                       this.owner, "onResuming"));
+}
+
 CIRCDCCState.prototype.sendAccept =
 function dccstate_sendAccept()
 {
-    if ((this.state != DCC_STATE_REQUESTED) || (this.dir != DCC_DIR_GETTING))
+    if (((this.state != DCC_STATE_REQUESTED) &&
+         (this.state != DCC_STATE_RESUMING)) ||
+        (this.dir != DCC_DIR_GETTING))
+    {
         throw "Must be in REQUESTED state and direction GET.";
+    }
 
     // Clear out "last" incoming request if that's us.
     if (this.parent.last == this.owner)
@@ -399,8 +520,12 @@ function dccstate_getAccept()
 CIRCDCCState.prototype.sendDecline =
 function dccstate_sendDecline()
 {
-    if ((this.state != DCC_STATE_REQUESTED) || (this.dir != DCC_DIR_GETTING))
+    if (((this.state != DCC_STATE_REQUESTED) &&
+         (this.state != DCC_STATE_RESUMING)) ||
+        (this.dir != DCC_DIR_GETTING))
+    {
         throw "Must be in REQUESTED state and direction GET.";
+    }
 
     // Clear out "last" incoming request if that's us.
     if (this.parent.last == this.owner)
@@ -671,6 +796,7 @@ CIRCDCCChat.prototype.onGotRequest =
 function dchat_onGotRequest(e)
 {
     this.state.getRequest();
+    this.parent.abortReplaced(this.remoteIP, this.port, this);
 
     // Pass over to the base user.
     e.destObject = this.user.netUser;
@@ -975,6 +1101,22 @@ function dfile_dispose()
     this.filestream = null;
 }
 
+CIRCDCCFileTransfer.prototype.isActive =
+function dfile_is_active()
+{
+    return (arrayIndexOf([DCC_STATE_RESUMING, DCC_STATE_ACCEPTED,
+                          DCC_STATE_CONNECTED, DCC_STATE_REQUESTED],
+                         this.state.state) >= 0);
+}
+
+CIRCDCCFileTransfer.prototype.isSameFile =
+function dfile_is_same_file(other)
+{
+    return ((this.filename == other.filename) &&
+            (this.size == other.size) &&
+            (this.user == other.user));
+}
+
 // Call to make this end offer DCC File to targeted user.
 CIRCDCCFileTransfer.prototype.request =
 function dfile_request(localFile)
@@ -985,13 +1127,21 @@ function dfile_request(localFile)
     this.filename = localFile.leafName;
     this.size = localFile.fileSize;
 
+    // Check if we're trying to send a file currently receiving a transfer
+    var rcv = this.parent.findFileTransfer(localFile, this);
+    if (rcv)
+        this.size = rcv.size;
+
     // Update view name.
     this.viewName = "File: " + this.filename;
 
     // Double-quote file names with spaces.
+    // Use a temporary variable so we don't mess up the filename field for
+    // later matches (if the targeted user tries to use DCC RESUME)
     // FIXME: Do we need any better checking?
-    if (this.filename.match(/ /))
-        this.filename = '"' + this.filename + '"';
+    var needQuotes = "";
+    if (/\s/.test(this.filename))
+        needQuotes = '"';
 
     this.localIP = this.parent.localIP;
 
@@ -1017,7 +1167,8 @@ function dfile_request(localFile)
         return false;
     // What should we do here? Panic?
 
-    this.user.netUser.ctcp("DCC", "SEND " + this.filename + " " +
+    this.user.netUser.ctcp("DCC", "SEND " +
+                           needQuotes + this.filename + needQuotes + " " +
                            ipNumber + " " + this.port + " " + this.size);
 
     return true;
@@ -1031,7 +1182,21 @@ function dfile_accept(localFile)
 
     this.state.sendAccept();
 
-    this.localFile = new LocalFile(localFile, ">");
+    // If DCC RESUME has been requested and answered successfully, append to
+    // the local target file
+    if (("resumingAt" in this) && ("resumingPick" in this))
+    {
+        // Ensure that the point we are resuming at really is the end of the
+        // existing file
+        if (this.resumingAt != localFile.fileSize)
+            return false;
+        this.localFile = new LocalFile(localFile, ">>");
+    }
+    else
+    {
+        this.localFile = new LocalFile(localFile, ">");
+        delete this.reofferFor;
+    }
     this.localPath = localFile.path;
 
     this.filestream = Components.classes["@mozilla.org/binaryoutputstream;1"];
@@ -1039,6 +1204,19 @@ function dfile_accept(localFile)
     this.filestream.setOutputStream(this.localFile.outputStream);
 
     this.position = 0;
+
+    // If we are resuming a transfer, our current position is the place we are
+    // resuming from
+    if (("resumingAt" in this) && ("resumingPick" in this))
+        this.position = this.resumingAt;
+
+    // Once the connection is in place, and our position is properly set, the
+    // fact that we are resuming a transfer has no further effect.
+    // If we tried to resume, and we received no confirmation of the other
+    // client's acceptance, we can no longer respond to a confirmation.
+    delete this.resumingAt;
+    delete this.resumingPick;
+
     this.connection = new CBSConnection(true);
     this.connection.connect(this.remoteIP, this.port, null, this);
 
@@ -1094,11 +1272,99 @@ function dfile_abort()
     if (this.state.state == DCC_STATE_CONNECTED)
     {
         this.disconnect();
+        this.state.sendAbort();
         return;
     }
 
     this.state.sendAbort();
     this.dispose();
+}
+
+CIRCDCCFileTransfer.prototype.resume =
+function dfile_resume(localFile)
+{
+    // To resume a transfer into a file, the file must exist and it must be
+    // smaller than the size of the completed transfer
+    if ((! localFile.exists()) || (localFile.fileSize >= this.size))
+        return false;
+
+    // We should also ensure that the chosen file to write to isn't already
+    // receiving a file transfer
+    if (this.parent.findFileTransfer(localFile, this))
+        return false;
+
+    this.state.sendResume();
+    this.resumingPick = localFile;
+
+    // Determine if quotes need to be added to the filename we pass
+    var needQuotes = "";
+    if (/\s/.test(this.filename))
+        needQuotes = '"';
+
+    // Ask the offering client to resume from the end of our available length
+    this.user.netUser.ctcp("DCC", "RESUME " +
+                           needQuotes + this.filename + needQuotes + " " +
+                           this.port + " " + localFile.fileSize);
+
+    return true;
+}
+
+CIRCDCCFileTransfer.prototype.resuming =
+function dfile_resuming(resumeAt)
+{
+    // This completes the connection to resume a transfer.
+    // It should not be called before the sending client has responded to
+    // the DCC RESUME message sent to it.
+    if (! this.resumingPick)
+        return false;
+
+    // On SeaMonkey 1.1.14, this next line is required to update the
+    // nsLocalFile instance's file status information.
+    this.resumingPick = new nsLocalFile(this.resumingPick.path);
+
+    // If the destination file no longer exists, or its size has changed
+    // since the RESUME request was sent, the transfer offer is no longer
+    // valid, and should be rejected -- either someone else is writing to
+    // the file, or the user might have erased or moved the file as a way
+    // to cancel the transfer.
+    if ((! this.resumingPick.exists()) ||
+        (this.resumingPick.fileSize != resumeAt))
+    {
+        this.state.failed();
+        this.user.netUser.ctcp("DCC", "REJECT FILE " + this.filename);
+        this.dispose();
+        return false;
+    }
+
+    this.resumingAt = resumeAt;
+
+    return ((this.accept(this.resumingPick)) ||
+            (this.state == DCC_STATE_CONNECTED) ||
+            (this.state.state == DCC_STATE_CONNECTED));
+}
+
+CIRCDCCFileTransfer.prototype.onGotResume =
+function dfile_onGotResume(e)
+{
+    // This is called when the receiving client asks us to resume the transfer
+    // from a given point.
+    this.state.getResume();
+    this.resumingAt = e.resumeAt;
+
+    // Determine if quotes need to be added to the filename we pass
+    var needQuotes = "";
+    if (/\s/.test(this.filename))
+        needQuotes = '"';
+
+    // Tell the other end that we received and understood the RESUME request
+    // (And no, mIRC doesn't check if the file being offered is smaller than
+    // the requested resume-at point, either.)
+    this.user.netUser.ctcp("DCC", "ACCEPT " +
+                           needQuotes + this.filename + needQuotes + " " +
+                           this.port + " " + e.resumeAt);
+
+    // Pass over to the base user.
+    e.destObject = this.user.netUser;
 }
 
 // Event to handle a request from the target user.
@@ -1107,6 +1373,7 @@ CIRCDCCFileTransfer.prototype.onGotRequest =
 function dfile_onGotRequest(e)
 {
     this.state.getRequest();
+    this.parent.abortReplaced(this.remoteIP, this.port, this);
 
     // Pass over to the base user.
     e.destObject = this.user.netUser;
@@ -1123,6 +1390,11 @@ function dfile_onSocketAccepted(socket, transport)
 
     this.state.socketConnected();
 
+    // This should only happen if someone else intentionally
+    // sends a bad (i.e. too large) resuming point.
+    if (("resumingAt" in this) && (this.resumingAt >= this.size))
+        return this.abort();
+
     this.position = 0;
     this.ackPosition = 0;
     this.remoteIP = transport.host;
@@ -1137,8 +1409,28 @@ function dfile_onSocketAccepted(socket, transport)
 
         // Start the reading!
         var d;
-        if (this.parent.sendChunk > this.size)
-            d = this.filestream.readBytes(this.size);
+
+        if ("resumingAt" in this)
+        {
+            // Skip the bytes we're to start after
+            // This would be much easier if we could seek in the file.
+            var toRead = this.resumingAt;
+            while (toRead >= this.parent.sendChunk)
+            {
+                d = this.filestream.readBytes(this.parent.sendChunk);
+                toRead -= this.parent.sendChunk;
+            }
+            if (toRead > 0)
+                d = this.filestream.readBytes(toRead);
+
+            this.position = this.resumingAt;
+            this.ackPosition = this.position;
+            delete this.resumingAt;
+        }
+
+        var available = this.size - this.position;
+        if (this.parent.sendChunk > available)
+            d = this.filestream.readBytes(available);
         else
             d = this.filestream.readBytes(this.parent.sendChunk);
         this.position += d.length;
@@ -1252,7 +1544,20 @@ function dfile_dataavailable(e)
         }
         else if (this.state.dir == DCC_DIR_GETTING)
         {
-            this.filestream.writeBytes(e.data, e.data.length);
+            try {
+                this.filestream.writeBytes(e.data, e.data.length);
+            }
+            catch (ex)
+            {
+                if (! /NS_ERROR_FILE_NO_DEVICE_SPACE/.test(ex))
+                    throw ex;
+                var ev = new CEvent("dcc-file", "no-device-space", this,
+                                    "onNoDeviceSpace");
+                ev.sourceEvent = e;
+                this.eventPump.routeEvent(ev);
+                this.abort();
+                return true;
+            }
 
             // Send back ack data.
             this.position += e.data.length;

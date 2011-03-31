@@ -2801,6 +2801,36 @@ function serv_dccsend (e)
     return true;
 }
 
+CIRCServer.prototype.onDCCResume =
+CIRCServer.prototype.onDCCAccept =
+function serv_dccresume (e)
+{
+    /* The DCC RESUME message is sent to request that the specified transfer
+     * resume at the number of bytes into the file given ("resumeAt"). */
+
+    /* The DCC ACCEPT message is sent in reply to an accepted DCC RESUME
+     * message.  The reply _should_ always contains exactly the same
+     * information as the request... but, in practice, this is not always
+     * the case. */
+
+    var ary = e.DCCData.match(/([^ ]+) (\d+) (\d+)/);
+
+    // Filenames with spaces may be enclosed in double-quotes.
+    if ((ary[1][0] == '"') || (ary[1][ary[1].length - 1] == '"'))
+        ary = e.DCCData.match(/"(.+)" (\d+) (\d+)/);
+
+    if (ary == null)
+        return false;
+
+    e.file       = ary[1];
+    e.port       = Number(ary[2]);
+    e.resumeAt   = Number(ary[3]);
+    e.destObject = e.replyTo;
+    e.set = (e.replyTo == e.user) ? "user" : "channel";
+
+    return true;
+}
+
 function CIRCChannel(parent, unicodeName, encodedName)
 {
     // Both unicodeName and encodedName are optional, but at least one must be

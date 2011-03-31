@@ -131,7 +131,10 @@ function initPrefs()
          ["conference.limit",   150,      "appearance.misc"],
          ["connectTries",       -1,       ".connect"],
          ["copyMessages",       true,     "global"],
+         ["dcc.autoResume",     false,    "dcc"],
          ["dcc.autoAccept.delay", 10000,  "hidden"],
+         ["dcc.resume.fallback.delay", 1000, "hidden"],
+         ["dcc.resume.fallback.maxDelay", 45000, "hidden"],
          ["dcc.downloadsFolder", getURLSpecFromFile(downloadsPath.path),
                                           "dcc"],
          ["dcc.enabled",        true,     "dcc"],
@@ -1083,7 +1086,7 @@ function onDCCUserPrefChanged(user, prefName, newValue, oldValue)
         }
     };
 
-    for (var i = 0; client.dcc.chats.length; i++)
+    for (var i = 0; i < client.dcc.chats.length; i++)
     {
         var chat = client.dcc.chats[i];
         if (chat.user == user)
